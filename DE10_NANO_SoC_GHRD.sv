@@ -27,14 +27,17 @@ module DE10_NANO_SoC_GHRD(
     input  logic             HPS_DDR3_RZQ,
     output logic             HPS_DDR3_WE_N,
 
+    //////////// GPIO //////////
+    inout  logic  [35:0]     GPIO_D,
+
     //////////// LED //////////
     output logic  [ 7: 0]    LED,
 
     //////////// SWITCHES //////////
     input  logic  [ 3: 0]    SW,
      
-     //////////// SWITCHES //////////
-     input  logic  [ 1: 0]    KEY
+    //////////// SWITCHES //////////
+    input  logic  [ 1: 0]    KEY
 );
 
 //=======================================================
@@ -43,6 +46,9 @@ module DE10_NANO_SoC_GHRD(
 logic hps_fpga_reset_n;
 logic fpga_clk_50;
 
+//=======================================================
+//  RAM variables
+//=======================================================
 logic [15:0] address = 16'd0;
 logic read = 1'b0;
 logic write = 1'b0;
@@ -50,6 +56,19 @@ logic acknowledge;
 logic [31:0] read_data = 32'd0;
 logic [31:0] write_data = 32'd0;
 logic [3:0] byte_enable = 4'b1111;
+
+//=======================================================
+//  UART variables
+//=======================================================
+logic [7:0] uart_wdata;
+logic uart_write;
+logic uart_in_error;
+logic uart_in_ready;
+
+logic [7:0] uart_rdata;
+logic uart_out_ready;
+logic uart_out_error;
+logic uart_out_valid;
 
 // connection of internal logics
 assign fpga_clk_50 = FPGA_CLK1_50;
@@ -86,7 +105,20 @@ soc_system u_u0(
     .sdram_write(write),             //                .write
     .sdram_write_data(write_data),        //                .write_data
     .sdram_acknowledge(acknowledge),       //                .acknowledge
-    .sdram_read_data(read_data)
+    .sdram_read_data(read_data),
+
+    .uart_RXD(GPIO_D[0]), // uart_0_external_connection.rxd
+    .uart_TXD(GPIO_D[1]), //                           .txd
+
+    .uart_in_data(uart_wdata),
+    .uart_in_error(uart_in_error),
+    .uart_in_valid(uart_write),
+    .uart_in_ready(uart_in_ready),
+
+    .uart_out_ready(uart_out_ready),
+    .uart_out_data(uart_rdata),
+    .uart_out_error(uart_out_error),
+    .uart_out_valid(uart_out_valid)
 );
 
 //=======================================================
@@ -146,50 +178,18 @@ end
 //=======================================================
 //  CPU state enum and regs / wires
 //=======================================================
-
-logic fetch_done    = 0;
-logic decode_done   = 0;
-logic op_fetch_done = 0;
-logic exec_done     = 0;
-logic write_done    = 0;
-
 enum int unsigned {
-    CPU_STATE_INSTR_FETCH         = 1,
-    CPU_STATE_INSTR_DECODE        = 2,
-    CPU_STATE_INSTR_OPERAND_FETCH = 3,
-    CPU_STATE_INSTR_EXEC          = 4,
-    CPU_STATE_INSTR_WRITEBACK     = 5
-} cur_cpu_state, next_cpu_state;
-
-// State switch logic
-always_comb begin
-    next_cpu_state = cur_cpu_state;
-    case (cur_cpu_state)
-        CPU_STATE_INSTR_FETCH: begin
-            if (fetch_done) next_cpu_state = CPU_STATE_INSTR_DECODE;
-        end
-
-        CPU_STATE_INSTR_DECODE: begin
-            if (decode_done) next_cpu_state = CPU_STATE_INSTR_OPERAND_FETCH;
-        end
-
-        CPU_STATE_INSTR_OPERAND_FETCH: begin
-            if (op_fetch_done) next_cpu_state = CPU_STATE_INSTR_EXEC;
-        end
-
-        CPU_STATE_INSTR_EXEC: begin
-            if (exec_done) next_cpu_state = CPU_STATE_INSTR_WRITEBACK;
-        end
-
-        CPU_STATE_INSTR_WRITEBACK: begin
-            if (write_done) next_cpu_state = CPU_STATE_INSTR_FETCH;
-        end
-
-        default: begin
-            next_cpu_state = CPU_STATE_INSTR_FETCH;
-        end
-    endcase
-end
+    CPU_STATE_INSTR_FETCH           = 1,
+    CPU_STATE_INSTR_DECODE          = 2,
+    CPU_STATE_INSTR_IMM_FETCH       = 3,
+    CPU_STATE_INSTR_IMM_FETCH_1     = 4,
+    CPU_STATE_INSTR_OPERAND_FETCH   = 5,
+    CPU_STATE_INSTR_OPERAND_FETCH_1 = 6,
+    CPU_STATE_INSTR_EXEC            = 7,
+    CPU_STATE_INSTR_EXEC_1          = 8,
+    CPU_STATE_INSTR_WRITEBACK       = 9,
+    CPU_STATE_INSTR_WRITEBACK_1     = 10
+} cur_cpu_state;
 
 //=======================================================
 //  CPU single-step button setup.
@@ -214,122 +214,237 @@ reg   prev_pressed = 0;
 //  CPU instruction decoder / registers
 //=======================================================
 
-parameter int unsigned MEM_STACK_BASE = 256;
-parameter int unsigned REG_STACK_BASE = 1024;
-parameter int unsigned STATIC_ARGS_BASE = 1536;
+parameter MEM_STACK_BASE = 16'hFE;
+parameter REG_STACK_BASE = 16'h400;
+parameter MEM_BASE = 16'h400;
 
 reg [5:0]  cur_instruction = 6'd0;
-reg [15:0] PC = 0;
+reg [15:0] PC = 16'd0;
+reg [15:0] IMM_ADDR = 16'd0;
 reg [15:0] FR = 16'd0;
-reg [15:0] TOS           = MEM_STACK_BASE;
-reg [15:0] SP            = REG_STACK_BASE;
+reg [15:0] TOS = MEM_STACK_BASE;
+reg [15:0] SP  = REG_STACK_BASE;
 
 // CPU variables
-reg was_written = 0;
-reg [31:0] data = 31'd0;
-assign LED[7: 0] = data[7: 0];
+reg [31:0] data = 32'd0;
+reg [15:0] tmp_address = 16'd0;
+reg [15:0] tmp_word = 16'd0;
+reg [15:0] cur_imm = 16'd0;
+assign LED[7: 0] = PC[7:0];
+
+//=======================================================
+//  UART I/O variables and logic
+//=======================================================
+logic uart_write_req = 0;
+logic data_is_new = 0;
+logic [7:0] uart_data = 0;
+
+always_ff @(posedge fpga_clk_50) begin
+end
 
 always_ff @(posedge fpga_clk_50 or negedge hps_fpga_reset_n) begin
-    if (~hps_fpga_reset_n) begin
-        cur_mem_state <= MEM_STATE_INIT;
-        read_req <= '0;
-        write_req <= '0;
-        prev_pressed <= debounced_keys[1];
-        cycle_done <= 1;
-    end else begin
-        // Lotsa logic, sorry
-        cur_mem_state <= next_mem_state;
+if (~hps_fpga_reset_n) begin
 
-        if (~debounced_keys[0]) is_halted <= 0;
 
-        prev_pressed <= debounced_keys[1];
-        case (cur_mem_state)
-            MEM_STATE_INIT: begin
+cur_mem_state <= MEM_STATE_INIT;
+cur_cpu_state <= CPU_STATE_INSTR_FETCH;
+cycle_done <= 1;
+
+read_req <= '0;
+write_req <= '0;
+prev_pressed <= debounced_keys[1];
+
+cur_instruction <= 6'd0;
+PC <= 0;
+FR <= 16'd0;
+TOS <= MEM_STACK_BASE;
+SP <= REG_STACK_BASE;
+uart_out_ready <= '1;
+uart_write <= 0;
+
+
+end else begin
+
+
+if (uart_out_valid) begin
+    uart_data <= uart_rdata;
+    data_is_new <= '1;
+end
+
+if (uart_write_req & uart_in_ready & ~uart_out_valid) begin
+    uart_out_ready <= 0;
+    uart_write <= 1;
+    uart_write_req <= 0;
+end else begin
+    uart_out_ready <= 1;
+    uart_write <= 0;
+end
+// Lotsa logic, sorry
+cur_mem_state <= next_mem_state;
+
+if (~debounced_keys[0]) is_halted <= 0;
+if (~debounced_keys[0] & SW[1]) PC <= 0;
+
+prev_pressed <= debounced_keys[1];
+case (cur_mem_state)
+    MEM_STATE_INIT: begin
+    end
+
+    MEM_STATE_READ_PENDING: begin
+        if (acknowledge) data <= read_data;
+        read_req <= 0;
+        write_req <= 0;
+    end
+
+    MEM_STATE_WRITE_PENDING: begin
+        read_req <= 0;
+        write_req <= 0;
+    end
+
+    default: begin
+        read_req <= 0;
+        write_req <= 0;
+    end
+endcase
+
+//=======================================================
+//  The instruction decoder itself. Finally )
+//=======================================================
+if (
+    ~SW[1] & // If SW[1] is on, we wait for button 0 to set PC to 0
+    cur_mem_state == MEM_STATE_INIT & ~is_halted & // Only do cpu stuff when memory is not read/written to
+    ~read_req & ~write_req & // Same as line one
+    ~uart_write_req & // Can't do UART either (
+    (~SW[3] | (prev_pressed & ~debounced_keys[1] & cycle_done) | ~cycle_done) // Button checker
+    ) begin
+cycle_done <= cur_cpu_state == CPU_STATE_INSTR_WRITEBACK_1;
+
+    case (cur_cpu_state)
+        CPU_STATE_INSTR_FETCH: begin
+            cur_cpu_state <= CPU_STATE_INSTR_DECODE;
+        end
+
+        CPU_STATE_INSTR_DECODE: begin
+            cur_cpu_state <= CPU_STATE_INSTR_IMM_FETCH;
+        end
+
+        CPU_STATE_INSTR_IMM_FETCH: begin
+            cur_cpu_state <= CPU_STATE_INSTR_IMM_FETCH_1;
+        end
+
+        CPU_STATE_INSTR_IMM_FETCH_1: begin
+            cur_cpu_state <= CPU_STATE_INSTR_OPERAND_FETCH;
+        end
+
+        CPU_STATE_INSTR_OPERAND_FETCH: begin
+            cur_cpu_state <= CPU_STATE_INSTR_OPERAND_FETCH_1;
+        end
+
+        CPU_STATE_INSTR_OPERAND_FETCH_1: begin
+            cur_cpu_state <= CPU_STATE_INSTR_EXEC;
+        end
+
+        CPU_STATE_INSTR_EXEC: begin
+            cur_cpu_state <= CPU_STATE_INSTR_EXEC_1;
+        end
+
+        CPU_STATE_INSTR_EXEC_1: begin
+            cur_cpu_state <= CPU_STATE_INSTR_WRITEBACK;
+        end
+
+        CPU_STATE_INSTR_WRITEBACK: begin
+            cur_cpu_state <= CPU_STATE_INSTR_WRITEBACK_1;
+        end
+
+        CPU_STATE_INSTR_WRITEBACK_1: begin
+            cur_cpu_state <= CPU_STATE_INSTR_FETCH;
+        end
+
+        default: begin
+            cur_cpu_state <= CPU_STATE_INSTR_FETCH;
+        end
+    endcase
+
+    if (cur_cpu_state == CPU_STATE_INSTR_FETCH) begin
+        // 4 CPU instrictuions fit into 4 bytes, could be 5, but naaah
+        byte_enable <= 4'b1111;
+        address <= {PC[15:2], 2'b00};
+        IMM_ADDR <= PC + 16'd1;
+        PC <= PC + 16'd1;
+        read_req <= 1;
+    end else if (cur_cpu_state == CPU_STATE_INSTR_DECODE) begin
+        case (PC[1:0])
+            2'b00: begin
+                cur_instruction <= data[29:24];
+                if (data[29]) begin
+                    PC <= PC + 16'd2;
+                    address <= {IMM_ADDR[15:2] , 2'b00};
+                    read_req <= '1;
+                    byte_enable <= 4'b1111;
+                end
             end
-
-            MEM_STATE_READ_PENDING: begin
-                if (acknowledge) data <= read_data;
-                read_req <= 0;
-                write_req <= 0;
+            2'b01: begin
+                cur_instruction <= data[5:0];
+                if (data[5]) begin
+                    PC <= PC + 16'd2;
+                    address <= {IMM_ADDR[15:2] , 2'b00};
+                    read_req <= '1;
+                    byte_enable <= 4'b1111;
+                end
             end
-
-            MEM_STATE_WRITE_PENDING: begin
-                read_req <= 0;
-                write_req <= 0;
+            2'b10: begin 
+                cur_instruction <= data[13:8];
+                if (data[13]) begin
+                    PC <= PC + 16'd2;
+                    address <= {IMM_ADDR[15:2] , 2'b00};
+                    read_req <= '1;
+                    byte_enable <= 4'b1111;
+                end
             end
-
+            2'b11: begin
+                cur_instruction <= data[21:16];
+                if (data[21]) begin
+                    PC <= PC + 16'd2;
+                    address <= {IMM_ADDR[15:2] , 2'b00};
+                    read_req <= '1;
+                    byte_enable <= 4'b1111;
+                end
+            end
             default: begin
-                read_req <= 0;
-                write_req <= 0;
             end
         endcase
-
-        //=======================================================
-        //  The instruction decoder itself. Finally )
-        //=======================================================
-        if (cur_mem_state == MEM_STATE_INIT & ~is_halted &
-            (~SW[3] | (prev_pressed & ~debounced_keys[1] & cycle_done) | ~cycle_done)) begin
-
-            if (cur_cpu_state == CPU_STATE_INSTR_FETCH) begin
-                // 5 CPU instrictuions fit into 4 bytes 32 = 6 * 5 + 2
-                address <= REG_STACK_BASE + PC % 5;
-                read_req <= 1;
-                PC <= PC + '1;
-                cycle_done <= '0;
-
-                fetch_done    <= '1;
-                decode_done   <= '0;
-                op_fetch_done <= '0;
-                exec_done     <= '0;
-                write_done    <= '0;
-            end else if (cur_cpu_state == CPU_STATE_INSTR_DECODE) begin
-                cur_instruction <= data[5 * (PC % 5) + 5 -: 6];
-                fetch_done    <= '0;
-                decode_done   <= '1;
-                op_fetch_done <= '0;
-                exec_done     <= '0;
-                write_done    <= '0;
-            end else begin
-                case (cur_instruction)
-                    6'b000000: begin
-                        case (cur_cpu_state)
-                            CPU_STATE_INSTR_OPERAND_FETCH: begin
-                                fetch_done    <= '0;
-                                decode_done   <= '0;
-                                op_fetch_done <= '1;
-                                exec_done     <= '0;
-                                write_done    <= '0;
-                            end
-
-                            CPU_STATE_INSTR_EXEC: begin
-                                fetch_done    <= '0;
-                                decode_done   <= '0;
-                                op_fetch_done <= '0;
-                                exec_done     <= '1;
-                                write_done    <= '0;
-                            end
-
-                            CPU_STATE_INSTR_WRITEBACK: begin
-                                fetch_done    <= '0;
-                                decode_done   <= '0;
-                                op_fetch_done <= '0;
-                                exec_done     <= '1;
-                                write_done    <= '1;
-
-                                is_halted <= '1;
-                                cycle_done <= '0;
-                            end
-
-                            default: begin
-                            end
-                        endcase
-                    end
-                    default: begin
-                    end
-                endcase
+    end else if (cur_instruction[5] & cur_cpu_state == CPU_STATE_INSTR_IMM_FETCH) begin
+        case (IMM_ADDR[1:0])
+            2'b00: cur_imm <= data[15:0];
+            2'b01: cur_imm <= data[23:8];
+            2'b10: cur_imm <= data[31:16];
+            2'b11: begin
+                cur_imm[7:0] <= data[31:24];
+                address <= {IMM_ADDR[15:2], 2'b00} + 16'd4;
+                read_req <= '1;
+                byte_enable <= 4'b1111;
             end
+            default: begin
+            end
+        endcase
+    end else if (cur_instruction[5] & cur_cpu_state == CPU_STATE_INSTR_IMM_FETCH_1) begin
+        case (IMM_ADDR[1:0])
+            2'b11: begin
+                cur_imm[15:8] <= data[7:0];
+            end
+            default: begin
+            end
+        endcase
+    end else begin
+        case (cur_instruction)
+        // NOP, lol
+        default: begin
         end
-    end
+    endcase
+end
+
+end
+end
 end
 
 endmodule

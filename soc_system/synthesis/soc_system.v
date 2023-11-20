@@ -29,7 +29,17 @@ module soc_system (
 		input  wire        sdram_write,             //                .write
 		input  wire [31:0] sdram_write_data,        //                .write_data
 		output wire        sdram_acknowledge,       //                .acknowledge
-		output wire [31:0] sdram_read_data          //                .read_data
+		output wire [31:0] sdram_read_data,         //                .read_data
+		input  wire        uart_RXD,                //            uart.RXD
+		output wire        uart_TXD,                //                .TXD
+		input  wire [7:0]  uart_in_data,            //         uart_in.data
+		input  wire        uart_in_error,           //                .error
+		input  wire        uart_in_valid,           //                .valid
+		output wire        uart_in_ready,           //                .ready
+		input  wire        uart_out_ready,          //        uart_out.ready
+		output wire [7:0]  uart_out_data,           //                .data
+		output wire        uart_out_error,          //                .error
+		output wire        uart_out_valid           //                .valid
 	);
 
 	wire  [31:0] bridge_0_avalon_master_readdata;                                        // mm_interconnect_0:bridge_0_avalon_master_readdata -> bridge_0:avalon_readdata
@@ -66,7 +76,7 @@ module soc_system (
 	wire         mm_interconnect_1_hps_0_f2h_sdram0_data_write;                          // mm_interconnect_1:hps_0_f2h_sdram0_data_write -> hps_0:f2h_sdram0_WRITE
 	wire  [63:0] mm_interconnect_1_hps_0_f2h_sdram0_data_writedata;                      // mm_interconnect_1:hps_0_f2h_sdram0_data_writedata -> hps_0:f2h_sdram0_WRITEDATA
 	wire   [7:0] mm_interconnect_1_hps_0_f2h_sdram0_data_burstcount;                     // mm_interconnect_1:hps_0_f2h_sdram0_data_burstcount -> hps_0:f2h_sdram0_BURSTCOUNT
-	wire         rst_controller_reset_out_reset;                                         // rst_controller:reset_out -> [address_span_extender_0:reset, bridge_0:reset, mm_interconnect_0:bridge_0_reset_reset_bridge_in_reset_reset, mm_interconnect_1:address_span_extender_0_reset_reset_bridge_in_reset_reset]
+	wire         rst_controller_reset_out_reset;                                         // rst_controller:reset_out -> [address_span_extender_0:reset, bridge_0:reset, mm_interconnect_0:bridge_0_reset_reset_bridge_in_reset_reset, mm_interconnect_1:address_span_extender_0_reset_reset_bridge_in_reset_reset, rs232_0:reset]
 	wire         rst_controller_001_reset_out_reset;                                     // rst_controller_001:reset_out -> mm_interconnect_1:hps_0_f2h_sdram0_data_translator_reset_reset_bridge_in_reset_reset
 
 	altera_address_span_extender #(
@@ -158,6 +168,21 @@ module soc_system (
 		.f2h_sdram0_WRITEDATA     (mm_interconnect_1_hps_0_f2h_sdram0_data_writedata),     //                 .writedata
 		.f2h_sdram0_BYTEENABLE    (mm_interconnect_1_hps_0_f2h_sdram0_data_byteenable),    //                 .byteenable
 		.f2h_sdram0_WRITE         (mm_interconnect_1_hps_0_f2h_sdram0_data_write)          //                 .write
+	);
+
+	soc_system_rs232_0 rs232_0 (
+		.clk             (clk_clk),                        //                        clk.clk
+		.reset           (rst_controller_reset_out_reset), //                      reset.reset
+		.from_uart_ready (uart_out_ready),                 // avalon_data_receive_source.ready
+		.from_uart_data  (uart_out_data),                  //                           .data
+		.from_uart_error (uart_out_error),                 //                           .error
+		.from_uart_valid (uart_out_valid),                 //                           .valid
+		.to_uart_data    (uart_in_data),                   //  avalon_data_transmit_sink.data
+		.to_uart_error   (uart_in_error),                  //                           .error
+		.to_uart_valid   (uart_in_valid),                  //                           .valid
+		.to_uart_ready   (uart_in_ready),                  //                           .ready
+		.UART_RXD        (uart_RXD),                       //         external_interface.export
+		.UART_TXD        (uart_TXD)                        //                           .export
 	);
 
 	soc_system_mm_interconnect_0 mm_interconnect_0 (
